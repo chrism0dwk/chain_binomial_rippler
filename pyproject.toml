@@ -14,10 +14,14 @@ matplotlib = "^3.4.3"
 ipympl = "^0.8.2"
 libclang = "<12.0.0"
 pandas = "^1.3.5"
+tensorboard-plugin-profile = "^2.5.0"
 
 [tool.poetry.dev-dependencies]
 jupyterlab = "^3.2.1"
 ipython = "^7.28.0"
+
+[tool.black]
+line-length=79
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

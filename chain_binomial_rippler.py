@@ -1,8 +1,10 @@
 """Chain binomial process rippler algorithm"""
 
+import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 from tensorflow_probability.python.internal import samplers
+from tensorflow_probability.python.internal import prefer_static as ps
 
 from gemlib.util import compute_state
 from gemlib.distributions import UniformInteger
@@ -10,6 +12,44 @@ from gemlib.distributions import UniformInteger
 tfd = tfp.distributions
 
 __all__ = ["chain_binomial_rippler"]
+
+
+def _get_src_states(stoichiometry):
+    """Iterate over rows in `stoichiometry` and return
+       the index of the column containing a `-1`"""
+    src_states = tf.where(tf.math.equal(stoichiometry, -1.0))
+    return src_states[:, 1]
+
+
+def _compute_state(initial_state, events, stoichiometry, closed=False):
+    """Computes a state tensor from initial state and event tensor
+
+    :param initial_state: a tensor of shape [S, M]
+    :param events: a tensor of shape [T, R, M]
+    :param stoichiometry: a stoichiometry matrix of shape [R, S] describing
+                          how transitions update the state.
+    :param closed: if `True`, return state in close interval [0, T], otherwise [0, T)
+    :return: a tensor of shape [T, S, M] if `closed=False` or [T+1, S, M] if `closed=True`
+             describing the state of the
+             system for each batch M at time T.
+    """
+    if isinstance(stoichiometry, tf.Tensor):
+        stoichiometry = ps.cast(stoichiometry, dtype=events.dtype)
+    else:
+        stoichiometry = tf.convert_to_tensor(stoichiometry, dtype=events.dtype)
+
+    increments = tf.einsum("...trm,rs->...tsm", events, stoichiometry)
+
+    if closed is False:
+        cum_increments = tf.cumsum(increments, axis=-3, exclusive=True)
+    else:
+        cum_increments = tf.cumsum(increments, axis=-3, exclusive=False)
+        cum_increments = tf.concat(
+            [tf.zeros_like(cum_increments[..., 0:1, :, :]), cum_increments],
+            axis=-2,
+        )
+    state = cum_increments + tf.expand_dims(initial_state, axis=-3)
+    return state
 
 
 def _log_factorial(x):
@@ -70,9 +110,9 @@ def random_hypergeom(n_samples, N, K, n, seed=None, validate_args=False):
         # Create a `[N]` tensor of random uniforms,
         # the top `n` of which mark out our units of
         # interest.
-        u = tfd.Uniform(low=tf.zeros(N), high=1.0, validate_args=validate_args,).sample(
-            n_samples, seed=seed
-        )
+        u = tfd.Uniform(
+            low=tf.zeros(N), high=1.0, validate_args=validate_args,
+        ).sample(n_samples, seed=seed)
 
         # How to vectorize this wrt n?
         _, indices = tf.math.top_k(u, k=tf.squeeze(n))
@@ -97,7 +137,9 @@ def _psltp(z, p, ps, seed=None, validate_args=False):
     """
     with tf.name_scope("psltp"):
         return tfd.Binomial(
-            total_count=tf.cast(z, p.dtype), probs=ps / p, validate_args=validate_args
+            total_count=tf.cast(z, p.dtype),
+            probs=ps / p,
+            validate_args=validate_args,
         ).sample(seed=seed)
 
 
@@ -135,7 +177,9 @@ def _xsgtx(z, x, xs, ps, seed=None, validate_args=False):
     """
     with tf.name_scope("xsgtx"):
         return z + tfd.Binomial(
-            total_count=tf.cast(xs - x, ps.dtype), probs=ps, validate_args=validate_args
+            total_count=tf.cast(xs - x, ps.dtype),
+            probs=ps,
+            validate_args=validate_args,
         ).sample(seed=seed)
 
 
@@ -153,10 +197,12 @@ def _xsltx(z, x, xs, seed=None, validate_args=False):
     """
     with tf.name_scope("xsltx"):
         res = tf.cast(
-            random_hypergeom(1, N=x, K=z, n=xs, seed=seed, validate_args=validate_args),
+            random_hypergeom(
+                1, N=x, K=z, n=xs, seed=seed, validate_args=validate_args
+            ),
             z.dtype,
         )
-        return res
+        return tf.squeeze(res)
 
 
 def _dispatch_update(z, x, p, xs, ps, seed=None, validate_args=False):
@@ -191,7 +237,7 @@ def _dispatch_update(z, x, p, xs, ps, seed=None, validate_args=False):
                 lambda: z,
                 lambda: _psgtp(z, x, p, ps, seeds[0], validate_args),
             ],
-            name="step_0",
+            name="switch_step_0",
         )
 
         idx = tf.cast(tf.math.sign(xs - x), tf.int32) + 1
@@ -202,7 +248,7 @@ def _dispatch_update(z, x, p, xs, ps, seed=None, validate_args=False):
                 lambda: z_prime,
                 lambda: _xsgtx(z_prime, x, xs, ps, seeds[1], validate_args),
             ],
-            name="step_1",
+            name="switch_step_1",
         )
 
         return z_new
@@ -210,92 +256,141 @@ def _dispatch_update(z, x, p, xs, ps, seed=None, validate_args=False):
 
 # Tests
 def test_dispatch():
-    _dispatch_update(z=10, x=100, p=0.1, xs=100, ps=0.1)
-    _dispatch_update(z=10, x=100, p=0.1, xs=100, ps=0.05)
-    _dispatch_update(z=10, x=100, p=0.1, xs=100, ps=0.2)
-    _dispatch_update(z=10, x=100, p=0.1, xs=50, ps=0.1)
-    _dispatch_update(z=10, x=100, p=0.1, xs=50, ps=0.05)
-    _dispatch_update(z=10, x=100, p=0.1, xs=50, ps=0.2)
-    _dispatch_update(z=10, x=100, p=0.1, xs=200, ps=0.1)
-    _dispatch_update(z=10, x=100, p=0.1, xs=200, ps=0.05)
-    _dispatch_update(z=10, x=100, p=0.1, xs=200, ps=0.2)
-
-
-# @tf.function(jit_compile=False)
-def chain_binomial_rippler(model, current_events, seed=None):
-
-    seed = samplers.sanitize_seed(seed, salt="chain_binomial_rippler")
-    seeds = samplers.split_seed(seed, n=3)
-
-    num_steps = model.num_steps
-
-    # Calculate current state
-    current_state = compute_state(
-        initial_state=model.initial_state,
-        events=current_events,
-        stoichiometry=model.stoichiometry,
+    tf.debugging.assert_scalar(
+        _dispatch_update(z=10, x=100, p=0.1, xs=100, ps=0.1)
+    )
+    tf.debugging.assert_scalar(
+        _dispatch_update(z=10, x=100, p=0.1, xs=100, ps=0.05)
+    )
+    tf.debugging.assert_scalar(
+        _dispatch_update(z=10, x=100, p=0.1, xs=100, ps=0.2)
+    )
+    tf.debugging.assert_scalar(
+        _dispatch_update(z=10, x=100, p=0.1, xs=50, ps=0.1)
+    )
+    tf.debugging.assert_scalar(
+        _dispatch_update(z=10, x=100, p=0.1, xs=50, ps=0.05)
+    )
+    tf.debugging.assert_scalar(
+        _dispatch_update(z=10, x=100, p=0.1, xs=50, ps=0.2)
+    )
+    tf.debugging.assert_scalar(
+        _dispatch_update(z=10, x=100, p=0.1, xs=200, ps=0.1)
+    )
+    tf.debugging.assert_scalar(
+        _dispatch_update(z=10, x=100, p=0.1, xs=200, ps=0.05)
+    )
+    tf.debugging.assert_scalar(
+        _dispatch_update(z=10, x=100, p=0.1, xs=200, ps=0.2)
     )
 
-    # Transpose to [T, S/R, M]
-    current_events = tf.transpose(current_events, perm=(1, 2, 0))
-    current_state = tf.transpose(current_state, perm=(1, 2, 0))
+
+def _initial_ripple(model, current_events, current_state, seed):
+
+    init_time_seed, init_events_seed = samplers.split_seed(
+        seed, salt="_initial_ripple"
+    )
 
     # Choose timepoint, t
-    proposed_time_idx = UniformInteger(low=0, high=num_steps).sample(seed=seeds[0])
+    proposed_time_idx = UniformInteger(low=0, high=model.num_steps).sample(
+        seed=init_time_seed
+    )
     current_state_t = tf.gather(current_state, proposed_time_idx, axis=-3)
 
     # Choose new infection events at time t
     proposed_transition_rates = tf.stack(
-        model.transition_rates(proposed_time_idx, tf.transpose(current_state_t)), axis=0
+        model.transition_rates(
+            proposed_time_idx, tf.transpose(current_state_t)
+        ),
+        axis=0,
     )
-    prob_t = 1.0 - tf.math.exp(-proposed_transition_rates[0])  # First event to perturb.
+    prob_t = 1.0 - tf.math.exp(
+        -proposed_transition_rates[0]
+    )  # First event to perturb.
     new_si_events_t = tfd.Binomial(
         total_count=current_state_t[0], probs=prob_t,  # Perturb SI events here
-    ).sample(seed=seeds[1])
+    ).sample(seed=init_events_seed)
     new_events_t = tf.tensor_scatter_nd_update(
         current_events[proposed_time_idx], [[0, 0]], new_si_events_t
+    )
+
+    return proposed_time_idx, new_events_t, current_state_t
+
+
+def chain_binomial_rippler(model, current_events, seed=None):
+
+    init_seed, ripple_seed = samplers.split_seed(
+        seed, salt="chain_binomial_rippler"
+    )
+    src_states = _get_src_states(
+        model.stoichiometry
+    )  # source state of each transition
+
+    # Transpose to [T, S/R, M]
+    current_events = tf.transpose(current_events, perm=(1, 2, 0))
+
+    # Calculate current state
+    current_state = _compute_state(
+        initial_state=tf.transpose(model.initial_state),
+        events=current_events,
+        stoichiometry=model.stoichiometry,
+    )
+
+    # Begin the ripple by sampling a time point, and perturbing the events at that timepoint
+    proposed_time_idx, new_events_t, current_state_t = _initial_ripple(
+        model, current_events, current_state, init_seed
     )
     new_events = tf.tensor_scatter_nd_update(
         current_events, indices=[[proposed_time_idx]], updates=[new_events_t]
     )
 
     # Propagate from t+1 up to end of the timeseries
-    def draw_events(time, new_state_t):
+    def draw_events(
+        time, new_state_t, current_events_t, current_state_t, seed
+    ):
         with tf.name_scope("draw_events"):
-            current_state_t = tf.gather(current_state, time, axis=0)
-            current_events_t = tf.gather(current_events, time, axis=0)
-            proposed_infec_rate = tf.stack(
-                model.transition_rates(time, tf.transpose(new_state_t)), axis=0
-            )
-            current_infec_rate = tf.stack(
-                model.transition_rates(time, tf.transpose(current_state_t)), axis=0
-            )
 
-            ps = 1 - tf.math.exp(-proposed_infec_rate)
-            p = 1 - tf.math.exp(-current_infec_rate)
-
-            # Iterate over transitions
-            def dispatch_on_one_tx(i):
-                return _dispatch_update(
-                    z=current_events_t[i],
-                    x=current_state_t[i],
-                    p=p[i],
-                    xs=new_state_t[i],
-                    ps=ps[i],
-                    seed=seed,
-                    validate_args=False,
+            # Calculate transition rates for current and new states
+            def transition_probs(state):
+                rates = tf.stack(
+                    model.transition_rates(time, tf.transpose(state)), axis=-2
                 )
+                return 1.0 - tf.math.exp(-rates * model.time_delta)
 
-            update = tf.map_fn(
-                dispatch_on_one_tx,
-                elems=tf.range(current_events.shape[-2]),
-                fn_output_signature=current_events.dtype,
+            current_p = transition_probs(current_state_t)
+            new_p = transition_probs(new_state_t)
+
+            # Each iteration requires a transition and its
+            #  associated source state.
+            elems = [
+                tf.reshape(x, [-1])
+                for x in (
+                    current_events_t,
+                    tf.gather(current_state_t, indices=src_states),
+                    current_p,
+                    tf.gather(new_state_t, indices=src_states),
+                    new_p,
+                )
+            ] + [
+                samplers.split_seed(
+                    seed,
+                    n=tf.reduce_prod(current_events_t.shape),
+                    salt="draw_events",
+                )
+            ]
+            update = tf.vectorized_map(
+                lambda args: _dispatch_update(*args, validate_args=False),
+                elems=elems,
             )
-
+            update = tf.reshape(update, current_events_t.shape)
             tf.debugging.assert_non_negative(update)
             return update
 
-    def body(t, new_events_t, new_state_t, new_events_buffer):
+    def time_loop_body(t, new_events_t, new_state_t, new_events_buffer, seed):
+
+        sample_seed, next_seed = samplers.split_seed(
+            seed, salt="time_loop_body"
+        )
 
         # Propagate new_state[t] to new_state[t+1]
         new_state_t1 = new_state_t + tf.einsum(
@@ -303,23 +398,37 @@ def chain_binomial_rippler(model, current_events, seed=None):
         )
         tf.debugging.assert_non_negative(new_state_t1, summarize=100)
 
-        # Infection rates and draw new events
-        new_events_t1 = draw_events(t + 1, new_state_t1)
+        # Gather current states and events, and draw new events
+        new_events_t1 = draw_events(
+            t + 1,
+            new_state_t1,
+            current_events[t + 1],
+            current_state[t + 1],
+            sample_seed,
+        )
 
         # Update new_events_buffer
         new_events_buffer = tf.tensor_scatter_nd_update(
             new_events_buffer, indices=[[t + 1]], updates=[new_events_t1]
         )
 
-        return t + 1, new_events_t1, new_state_t1, new_events_buffer
+        return t + 1, new_events_t1, new_state_t1, new_events_buffer, next_seed
 
-    def cond(t, new_events_t, new_state_t, new_events_buffer):
-        return t < (num_steps - 1)
+    def time_loop_cond(t, _1, _2, new_events_buffer, _3):
+        t_stop = t < (model.num_steps - 1)
+        delta_stop = tf.reduce_any(new_events_buffer != current_events)
+        return t_stop & delta_stop
 
-    _, _, _, new_events = tf.while_loop(
-        cond,
-        body,
-        loop_vars=(proposed_time_idx, new_events_t, current_state_t, new_events),
+    _, _, _, new_events, _ = tf.while_loop(
+        time_loop_cond,
+        time_loop_body,
+        loop_vars=(
+            proposed_time_idx,
+            new_events_t,
+            current_state_t,
+            new_events,
+            ripple_seed,
+        ),
     )  # new_events.shape = [T, R, M]
 
     new_events = tf.transpose(new_events, perm=(2, 0, 1))
@@ -327,10 +436,11 @@ def chain_binomial_rippler(model, current_events, seed=None):
     return (
         new_events,
         {
-            "delta": tf.transpose(new_events_t - current_events[proposed_time_idx]),
+            "delta": tf.transpose(
+                new_events_t - current_events[proposed_time_idx]
+            ),
             "timepoint": proposed_time_idx,
-            "new_si_events_t": new_si_events_t,
+            "initial_ripple": new_events_t,
             "current_state_t": tf.transpose(current_state_t),
-            "prob_t": prob_t,
         },
     )
