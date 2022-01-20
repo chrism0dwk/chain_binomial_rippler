@@ -57,30 +57,30 @@ def random_hypergeom(n_samples, N, K, n, seed=None, validate_args=False):
     :param validate_args: if true ensure arguments are valid
     :returns: k, the number of units of interest in the sample
     """
+    with tf.name_scope("random_hypergeom"):
+        N = tf.cast(N, dtype=tf.int64)
+        K = tf.convert_to_tensor(K)
+        n = tf.cast(n, dtype=tf.int32)
 
-    N = tf.cast(N, dtype=tf.int64)
-    K = tf.convert_to_tensor(K)
-    n = tf.cast(n, dtype=tf.int32)
+        if validate_args is True:
+            tf.debugging.assert_non_negative(N)
+            tf.debugging.assert_non_negative(K)
+            tf.debugging.assert_non_negative(n)
 
-    if validate_args is True:
-        tf.debugging.assert_non_negative(N)
-        tf.debugging.assert_non_negative(K)
-        tf.debugging.assert_non_negative(n)
+        # Create a `[N]` tensor of random uniforms,
+        # the top `n` of which mark out our units of
+        # interest.
+        u = tfd.Uniform(low=tf.zeros(N), high=1.0, validate_args=validate_args,).sample(
+            n_samples, seed=seed
+        )
 
-    # Create a `[N]` tensor of random uniforms,
-    # the top `n` of which mark out our units of
-    # interest.
-    u = tfd.Uniform(low=tf.zeros(N), high=1.0, validate_args=validate_args,).sample(
-        n_samples, seed=seed
-    )
+        # How to vectorize this wrt n?
+        _, indices = tf.math.top_k(u, k=tf.squeeze(n))
 
-    # How to vectorize this wrt n?
-    _, indices = tf.math.top_k(u, k=tf.squeeze(n))
-
-    # Since order does not matter, `k` is just the sum of the indices < K
-    return tf.reduce_sum(
-        tf.cast(indices < tf.cast(K, indices.dtype), K.dtype), axis=-1,
-    )
+        # Since order does not matter, `k` is just the sum of the indices < K
+        return tf.reduce_sum(
+            tf.cast(indices < tf.cast(K, indices.dtype), K.dtype), axis=-1,
+        )
 
 
 # Basic rippler sampling functions
@@ -95,9 +95,10 @@ def _psltp(z, p, ps, seed=None, validate_args=False):
     :param ps: $p_star$ new probability
     :return: `z` the new number of events
     """
-    return tfd.Binomial(
-        total_count=tf.cast(z, p.dtype), probs=ps / p, validate_args=validate_args
-    ).sample(seed=seed)
+    with tf.name_scope("psltp"):
+        return tfd.Binomial(
+            total_count=tf.cast(z, p.dtype), probs=ps / p, validate_args=validate_args
+        ).sample(seed=seed)
 
 
 def _psgtp(z, x, p, ps, seed=None, validate_args=False):
@@ -111,10 +112,13 @@ def _psgtp(z, x, p, ps, seed=None, validate_args=False):
     :param ps: $p_star$ new probability
     :return: the new number of events
     """
-    prob = 1 - (1 - ps) / (1 - p)
-    return z + tfd.Binomial(
-        total_count=tf.cast(x - z, prob.dtype), probs=prob, validate_args=validate_args,
-    ).sample(seed=seed)
+    with tf.name_scope("psgtp"):
+        prob = 1 - (1 - ps) / (1 - p)
+        return z + tfd.Binomial(
+            total_count=tf.cast(x - z, prob.dtype),
+            probs=prob,
+            validate_args=validate_args,
+        ).sample(seed=seed)
 
 
 def _xsgtx(z, x, xs, ps, seed=None, validate_args=False):
@@ -129,9 +133,10 @@ def _xsgtx(z, x, xs, ps, seed=None, validate_args=False):
 
     :return: the new number of events
     """
-    return z + tfd.Binomial(
-        total_count=tf.cast(xs - x, ps.dtype), probs=ps, validate_args=validate_args
-    ).sample(seed=seed)
+    with tf.name_scope("xsgtx"):
+        return z + tfd.Binomial(
+            total_count=tf.cast(xs - x, ps.dtype), probs=ps, validate_args=validate_args
+        ).sample(seed=seed)
 
 
 def _xsltx(z, x, xs, seed=None, validate_args=False):
@@ -146,11 +151,12 @@ def _xsltx(z, x, xs, seed=None, validate_args=False):
 
     :return: the new number of events
     """
-    res = tf.cast(
-        random_hypergeom(1, N=x, K=z, n=xs, seed=seed, validate_args=validate_args),
-        z.dtype,
-    )
-    return res
+    with tf.name_scope("xsltx"):
+        res = tf.cast(
+            random_hypergeom(1, N=x, K=z, n=xs, seed=seed, validate_args=validate_args),
+            z.dtype,
+        )
+        return res
 
 
 def _dispatch_update(z, x, p, xs, ps, seed=None, validate_args=False):
@@ -167,36 +173,39 @@ def _dispatch_update(z, x, p, xs, ps, seed=None, validate_args=False):
 
     :returns: an updated number of events
     """
-    p = tf.convert_to_tensor(p)
-    ps = tf.convert_to_tensor(ps)
-    z = tf.cast(z, p.dtype)
-    x = tf.cast(x, p.dtype)
-    xs = tf.cast(xs, p.dtype)
+    with tf.name_scope("dispatch_update"):
+        p = tf.convert_to_tensor(p)
+        ps = tf.convert_to_tensor(ps)
+        z = tf.cast(z, p.dtype)
+        x = tf.cast(x, p.dtype)
+        xs = tf.cast(xs, p.dtype)
 
-    seeds = samplers.split_seed(seed, salt="_dispatch_update")
+        seeds = samplers.split_seed(seed, salt="_dispatch_update")
 
-    # Update for p->ps first
-    idx = tf.cast(tf.math.sign(ps - p), tf.int32) + 1
-    z_prime = tf.switch_case(
-        tf.squeeze(idx),
-        [
-            lambda: _psltp(z, p, ps, seeds[0], validate_args),
-            lambda: z,
-            lambda: _psgtp(z, x, p, ps, seeds[0], validate_args),
-        ],
-    )
+        # Update for p->ps first
+        idx = tf.cast(tf.math.sign(ps - p), tf.int32) + 1
+        z_prime = tf.switch_case(
+            tf.squeeze(idx),
+            [
+                lambda: _psltp(z, p, ps, seeds[0], validate_args),
+                lambda: z,
+                lambda: _psgtp(z, x, p, ps, seeds[0], validate_args),
+            ],
+            name="step_0",
+        )
 
-    idx = tf.cast(tf.math.sign(xs - x), tf.int32) + 1
-    z_new = tf.switch_case(
-        tf.squeeze(idx),
-        [
-            lambda: _xsltx(z_prime, x, xs, seeds[1], validate_args),
-            lambda: z_prime,
-            lambda: _xsgtx(z_prime, x, xs, ps, seeds[1], validate_args),
-        ],
-    )
+        idx = tf.cast(tf.math.sign(xs - x), tf.int32) + 1
+        z_new = tf.switch_case(
+            tf.squeeze(idx),
+            [
+                lambda: _xsltx(z_prime, x, xs, seeds[1], validate_args),
+                lambda: z_prime,
+                lambda: _xsgtx(z_prime, x, xs, ps, seeds[1], validate_args),
+            ],
+            name="step_1",
+        )
 
-    return z_new
+        return z_new
 
 
 # Tests
@@ -227,112 +236,101 @@ def chain_binomial_rippler(model, current_events, seed=None):
         stoichiometry=model.stoichiometry,
     )
 
+    # Transpose to [T, S/R, M]
+    current_events = tf.transpose(current_events, perm=(1, 2, 0))
+    current_state = tf.transpose(current_state, perm=(1, 2, 0))
+
     # Choose timepoint, t
     proposed_time_idx = UniformInteger(low=0, high=num_steps).sample(seed=seeds[0])
-    current_state_t = tf.gather(current_state, proposed_time_idx, axis=-2)
+    current_state_t = tf.gather(current_state, proposed_time_idx, axis=-3)
 
     # Choose new infection events at time t
     proposed_transition_rates = tf.stack(
-        model.transition_rates(proposed_time_idx, current_state_t), axis=-1
+        model.transition_rates(proposed_time_idx, tf.transpose(current_state_t)), axis=0
     )
-    prob_t = 1.0 - tf.math.exp(
-        -proposed_transition_rates[..., 0]
-    )  # First event to perturb.
+    prob_t = 1.0 - tf.math.exp(-proposed_transition_rates[0])  # First event to perturb.
     new_si_events_t = tfd.Binomial(
-        total_count=current_state_t[:, 0], probs=prob_t,  # Perturb SI events here
+        total_count=current_state_t[0], probs=prob_t,  # Perturb SI events here
     ).sample(seed=seeds[1])
     new_events_t = tf.tensor_scatter_nd_update(
-        current_events[:, proposed_time_idx, :], [[0, 0]], new_si_events_t
+        current_events[proposed_time_idx], [[0, 0]], new_si_events_t
+    )
+    new_events = tf.tensor_scatter_nd_update(
+        current_events, indices=[[proposed_time_idx]], updates=[new_events_t]
     )
 
     # Propagate from t+1 up to end of the timeseries
     def draw_events(time, new_state_t):
-
-        current_state_t = tf.gather(
-            current_state, time, axis=-2
-        )  # current_state.shape == [M, T, S]
-        current_events_t = tf.gather(
-            current_events, time, axis=-2
-        )  # current_events.shape == [M, T, R]
-
-        proposed_infec_rate = tf.stack(
-            model.transition_rates(time, new_state_t), axis=0
-        )
-        current_infec_rate = tf.stack(
-            model.transition_rates(time, current_state_t), axis=0
-        )
-
-        ps = 1 - tf.math.exp(-proposed_infec_rate)
-        p = 1 - tf.math.exp(-current_infec_rate)
-
-        # Iterate over transitions
-        def dispatch_on_one_tx(i):
-            return _dispatch_update(
-                z=current_events_t[..., i],
-                x=current_state_t[..., i],
-                p=p[i],
-                xs=new_state_t[..., i],
-                ps=ps[i],
-                seed=seed,
-                validate_args=False,
+        with tf.name_scope("draw_events"):
+            current_state_t = tf.gather(current_state, time, axis=0)
+            current_events_t = tf.gather(current_events, time, axis=0)
+            proposed_infec_rate = tf.stack(
+                model.transition_rates(time, tf.transpose(new_state_t)), axis=0
+            )
+            current_infec_rate = tf.stack(
+                model.transition_rates(time, tf.transpose(current_state_t)), axis=0
             )
 
-        update = tf.map_fn(
-            dispatch_on_one_tx,
-            elems=tf.range(current_events.shape[-1]),
-            fn_output_signature=current_events.dtype,
+            ps = 1 - tf.math.exp(-proposed_infec_rate)
+            p = 1 - tf.math.exp(-current_infec_rate)
+
+            # Iterate over transitions
+            def dispatch_on_one_tx(i):
+                return _dispatch_update(
+                    z=current_events_t[i],
+                    x=current_state_t[i],
+                    p=p[i],
+                    xs=new_state_t[i],
+                    ps=ps[i],
+                    seed=seed,
+                    validate_args=False,
+                )
+
+            update = tf.map_fn(
+                dispatch_on_one_tx,
+                elems=tf.range(current_events.shape[-2]),
+                fn_output_signature=current_events.dtype,
+            )
+
+            tf.debugging.assert_non_negative(update)
+            return update
+
+    def body(t, new_events_t, new_state_t, new_events_buffer):
+
+        # Propagate new_state[t] to new_state[t+1]
+        new_state_t1 = new_state_t + tf.einsum(
+            "...ik,ij->...jk", new_events_t, model.stoichiometry
         )
-        update = tf.reshape(
-            update, [current_events.shape[-3], current_events.shape[-1]],
-        )
-        tf.debugging.assert_non_negative(update)
-        return update
-
-    def propagate(accum, t):
-
-        # Previous state
-        events_t, state_t = accum
-        tf.debugging.assert_non_negative(events_t, summarize=100)
-        tf.debugging.assert_non_negative(state_t, summarize=100)
-        tf.debugging.assert_rank(events_t, 2)
-        tf.debugging.assert_rank(state_t, 2)
-
-        # Propagate previous state to new state
-        state_t1 = state_t + tf.einsum("...i,ij->...j", events_t, model.stoichiometry)
-        tf.debugging.assert_non_negative(state_t1, summarize=100)
+        tf.debugging.assert_non_negative(new_state_t1, summarize=100)
 
         # Infection rates and draw new events
-        events_t1 = draw_events(t + 1, state_t1)
+        new_events_t1 = draw_events(t + 1, new_state_t1)
 
-        return events_t1, state_t1
+        # Update new_events_buffer
+        new_events_buffer = tf.tensor_scatter_nd_update(
+            new_events_buffer, indices=[[t + 1]], updates=[new_events_t1]
+        )
 
-    timepoints = tf.range(proposed_time_idx, num_steps - 1)
+        return t + 1, new_events_t1, new_state_t1, new_events_buffer
 
-    new_events, new_state = tf.scan(
-        propagate,
-        elems=timepoints,
-        initializer=(new_events_t, current_state_t),  # MxR  # MxR
-    )
-    new_events = tf.transpose(new_events, perm=(1, 0, 2))
+    def cond(t, new_events_t, new_state_t, new_events_buffer):
+        return t < (num_steps - 1)
 
-    concat_events = tf.concat(
-        [
-            current_events[:, :proposed_time_idx],
-            tf.expand_dims(new_events_t, axis=-2),
-            new_events,
-        ],
-        axis=-2,
-    )
+    _, _, _, new_events = tf.while_loop(
+        cond,
+        body,
+        loop_vars=(proposed_time_idx, new_events_t, current_state_t, new_events),
+    )  # new_events.shape = [T, R, M]
 
-    concat_events = tf.ensure_shape(concat_events, current_events.shape)
+    new_events = tf.transpose(new_events, perm=(2, 0, 1))
 
     return (
-        concat_events,
+        new_events,
         {
-            "delta": new_events_t - current_events[:, proposed_time_idx, :],
+            "delta": tf.transpose(new_events_t - current_events[proposed_time_idx]),
             "timepoint": proposed_time_idx,
             "new_si_events_t": new_si_events_t,
-            "current_state_t": current_state_t,
+            "current_state_t": tf.transpose(current_state_t),
             "prob_t": prob_t,
         },
     )
