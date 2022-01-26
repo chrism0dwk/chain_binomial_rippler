@@ -287,8 +287,8 @@ def test_dispatch():
 
 def _initial_ripple(model, current_events, current_state, seed):
 
-    init_time_seed, init_events_seed = samplers.split_seed(
-        seed, salt="_initial_ripple"
+    init_time_seed, init_pop_seed, init_events_seed = samplers.split_seed(
+        seed, n=3, salt="_initial_ripple"
     )
 
     # Choose timepoint, t
@@ -296,6 +296,11 @@ def _initial_ripple(model, current_events, current_state, seed):
         seed=init_time_seed
     )
     current_state_t = tf.gather(current_state, proposed_time_idx, axis=-3)
+
+    # Choose subpopulation
+    proposed_pop_idx = UniformInteger(
+        low=0, high=current_events.shape[-1]
+    ).sample(seed=init_pop_seed)
 
     # Choose new infection events at time t
     proposed_transition_rates = tf.stack(
@@ -305,13 +310,21 @@ def _initial_ripple(model, current_events, current_state, seed):
         axis=0,
     )
     prob_t = 1.0 - tf.math.exp(
-        -proposed_transition_rates[0]
+        -tf.gather(proposed_transition_rates[0], proposed_pop_idx, axis=-1)
     )  # First event to perturb.
+    print("proposed_pop_idxtransition_rates:", proposed_pop_idx)
+    print("proposed_time_idx:", proposed_time_idx)
+    print("Prob_t:", prob_t)
     new_si_events_t = tfd.Binomial(
-        total_count=current_state_t[0], probs=prob_t,  # Perturb SI events here
+        total_count=tf.gather(current_state_t[0], proposed_pop_idx, axis=-1),
+        probs=prob_t,  # Perturb SI events here
     ).sample(seed=init_events_seed)
+    print("new_si_events_t:", new_si_events_t)
+
     new_events_t = tf.tensor_scatter_nd_update(
-        current_events[proposed_time_idx], [[0, 0]], new_si_events_t
+        current_events[proposed_time_idx],
+        [[0, proposed_pop_idx]],
+        [new_si_events_t],
     )
 
     return proposed_time_idx, new_events_t, current_state_t
