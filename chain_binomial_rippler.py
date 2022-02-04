@@ -110,99 +110,89 @@ def random_hypergeom(n_samples, N, K, n, seed=None, validate_args=False):
         # Create a `[N]` tensor of random uniforms,
         # the top `n` of which mark out our units of
         # interest.
+        num_variates = tf.zeros(N, name="zeros1")
         u = tfd.Uniform(
-            low=tf.zeros(N), high=1.0, validate_args=validate_args,
+            low=num_variates, high=1.0, validate_args=validate_args,
         ).sample(n_samples, seed=seed)
 
         # How to vectorize this wrt n?
         _, indices = tf.math.top_k(u, k=tf.squeeze(n))
 
         # Since order does not matter, `k` is just the sum of the indices < K
-        return tf.reduce_sum(
-            tf.cast(indices < tf.cast(K, indices.dtype), K.dtype), axis=-1,
+        return tf.reshape(
+            tf.reduce_sum(
+                tf.cast(indices < tf.cast(K, indices.dtype), K.dtype), axis=-1,
+            ),
+            K.shape,
         )
 
 
 # Basic rippler sampling functions
-def _psltp(z, p, ps, seed=None, validate_args=False):
-    """ If $x^\star = x, p^\star \leq p$ then
-         $$z^\star \sim \mbox{Binomial}(z, \frac{p_\star}{p})$$
+def _pstep(z, x, p, ps, seed=None, validate_args=False):
+    """Compute the p-step of Rippler.
+
+    Since there are two possible distributions to draw from,
+    but both are Binomial, we compute `offset`, `total_count`, and
+    `prob` parameters for both branches, and select which we need
+    based on p <= ps.
 
     :param z: current $z$
     :param x: current $x$
-    :param p: $p$ current probability
-    :param xs: $x^\star$ new state
-    :param ps: $p_star$ new probability
-    :return: `z` the new number of events
+    :param p: current probability
+    :param ps: new probability
     """
-    with tf.name_scope("psltp"):
-        return tfd.Binomial(
-            total_count=tf.cast(z, p.dtype),
-            probs=ps / p,
+    offset = tf.where(ps <= p, 0.0, z)
+    prob = tf.where(ps <= p, ps / p, 1 - (1 - ps) / (1 - p))
+    total_count = tf.where(
+        ps <= p, tf.cast(z, p.dtype), tf.cast(x - z, p.dtype)
+    )
+    z_prime = offset + tfd.Binomial(
+        total_count=total_count, probs=prob, validate_args=validate_args,
+    ).sample(seed=seed)
+    return z_prime
+
+
+def _xstep(z_prime, x, xs, ps, seed=None, validate_args=False):
+    """Computes the x-step of the Rippler algorithm.
+
+    Both xs >= x and xs < x are sampled and results selected.
+    """
+    seeds = samplers.split_seed(seed, salt="_xstep")
+
+    # xs >= x
+    # Switch off `validate_args` because `xs-x` may be -ve.
+    z_new_geq = z_prime + tfd.Binomial(
+        xs - x, probs=ps, validate_args=False
+    ).sample(seed=seeds[0])
+
+    # xs < x - explicitly vectorize
+    def one_hypergeom(args):
+        x, z_prime, xs, seed = args
+        return random_hypergeom(
+            n_samples=1,
+            N=x,
+            K=z_prime,
+            n=tf.math.minimum(x, xs),  # Guard against xs > x
+            seed=seed,
             validate_args=validate_args,
-        ).sample(seed=seed)
-
-
-def _psgtp(z, x, p, ps, seed=None, validate_args=False):
-    """ If $x^\star = x, p^\star > p$ then
-         $$z^\star \sim z + \mbox{Binomial}(x-z, \frac{p_\star - p}{1 - p})$$
-    
-    :param z: current $z$
-    :param x: current $x$
-    :param p: $p$ current probability
-    :param xs: $x^\star$ new state
-    :param ps: $p_star$ new probability
-    :return: the new number of events
-    """
-    with tf.name_scope("psgtp"):
-        prob = 1 - (1 - ps) / (1 - p)
-        return z + tfd.Binomial(
-            total_count=tf.cast(x - z, prob.dtype),
-            probs=prob,
-            validate_args=validate_args,
-        ).sample(seed=seed)
-
-
-def _xsgtx(z, x, xs, ps, seed=None, validate_args=False):
-    """ If $x^\star > x, p^\star = p$ then
-         $$z^\star \sim z + \mbox{Binomial}(xs-x, p_\star)$$
-
-    :param z: current $z$
-    :param x: current $x$
-    :param p: $p$ current probability
-    :param xs: $x^\star$ new state
-    :param ps: $p_star$ new probability
-
-    :return: the new number of events
-    """
-    with tf.name_scope("xsgtx"):
-        return z + tfd.Binomial(
-            total_count=tf.cast(xs - x, ps.dtype),
-            probs=ps,
-            validate_args=validate_args,
-        ).sample(seed=seed)
-
-
-def _xsltx(z, x, xs, seed=None, validate_args=False):
-    """ If $x^\star < x, p^\star = p$ then
-         $$z^\star \sim \mbox{Hypergeometric}(x, z, xs)$$
-
-    :param z: current $z$
-    :param x: current $x$
-    :param p: $p$ current probability
-    :param xs: $x^\star$ new state
-    :param ps: $p_star$ new probability
-
-    :return: the new number of events
-    """
-    with tf.name_scope("xsltx"):
-        res = tf.cast(
-            random_hypergeom(
-                1, N=x, K=z, n=xs, seed=seed, validate_args=validate_args
-            ),
-            z.dtype,
         )
-        return tf.squeeze(res)
+
+    elems = [tf.reshape(foo, [-1]) for foo in (x, z_prime, xs)] + [
+        samplers.split_seed(
+            seed[1],
+            n=tf.reduce_prod(z_prime.shape),
+            salt="_xstep_vectorized_map",
+        )
+    ]
+    z_new_lt = tf.reshape(
+        tf.cast(
+            tf.map_fn(one_hypergeom, elems, fn_output_signature=z_prime.dtype),
+            z_prime.dtype,
+        ),
+        z_prime.shape,
+    )
+
+    return tf.where(xs >= x, z_new_geq, z_new_lt)
 
 
 def _dispatch_update(z, x, p, xs, ps, seed=None, validate_args=False):
@@ -229,26 +219,9 @@ def _dispatch_update(z, x, p, xs, ps, seed=None, validate_args=False):
         seeds = samplers.split_seed(seed, salt="_dispatch_update")
 
         # Update for p->ps first
-        idx = tf.cast(tf.math.sign(ps - p), tf.int32) + 1
-        z_prime = tf.switch_case(
-            tf.squeeze(idx),
-            [
-                lambda: _psltp(z, p, ps, seeds[0], validate_args),
-                lambda: z,
-                lambda: _psgtp(z, x, p, ps, seeds[0], validate_args),
-            ],
-            name="switch_step_0",
-        )
-
-        idx = tf.cast(tf.math.sign(xs - x), tf.int32) + 1
-        z_new = tf.switch_case(
-            tf.squeeze(idx),
-            [
-                lambda: _xsltx(z_prime, x, xs, seeds[1], validate_args),
-                lambda: z_prime,
-                lambda: _xsgtx(z_prime, x, xs, ps, seeds[1], validate_args),
-            ],
-            name="switch_step_1",
+        z_prime = _pstep(z, x, p, ps, seed=seeds[0])
+        z_new = _xstep(
+            z_prime, x, xs, ps, seed=seeds[1], validate_args=validate_args
         )
 
         return z_new
@@ -312,15 +285,11 @@ def _initial_ripple(model, current_events, current_state, seed):
     prob_t = 1.0 - tf.math.exp(
         -tf.gather(proposed_transition_rates[0], proposed_pop_idx, axis=-1)
     )  # First event to perturb.
-    print("proposed_pop_idxtransition_rates:", proposed_pop_idx)
-    print("proposed_time_idx:", proposed_time_idx)
-    print("Prob_t:", prob_t)
+
     new_si_events_t = tfd.Binomial(
         total_count=tf.gather(current_state_t[0], proposed_pop_idx, axis=-1),
         probs=prob_t,  # Perturb SI events here
     ).sample(seed=init_events_seed)
-    print("new_si_events_t:", new_si_events_t)
-
     new_events_t = tf.tensor_scatter_nd_update(
         current_events[proposed_time_idx],
         [[0, proposed_pop_idx]],
@@ -373,29 +342,14 @@ def chain_binomial_rippler(model, current_events, seed=None):
             current_p = transition_probs(current_state_t)
             new_p = transition_probs(new_state_t)
 
-            # Each iteration requires a transition and its
-            #  associated source state.
-            elems = [
-                tf.reshape(x, [-1])
-                for x in (
-                    current_events_t,
-                    tf.gather(current_state_t, indices=src_states),
-                    current_p,
-                    tf.gather(new_state_t, indices=src_states),
-                    new_p,
-                )
-            ] + [
-                samplers.split_seed(
-                    seed,
-                    n=tf.reduce_prod(current_events_t.shape),
-                    salt="draw_events",
-                )
-            ]
-            update = tf.vectorized_map(
-                lambda args: _dispatch_update(*args, validate_args=False),
-                elems=elems,
+            update = _dispatch_update(
+                current_events_t,
+                tf.gather(current_state_t, indices=src_states),
+                current_p,
+                tf.gather(new_state_t, indices=src_states),
+                new_p,
+                seed,
             )
-            update = tf.reshape(update, current_events_t.shape)
             tf.debugging.assert_non_negative(update)
             return update
 
