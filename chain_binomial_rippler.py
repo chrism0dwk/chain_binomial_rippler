@@ -9,16 +9,11 @@ from tensorflow_probability.python.internal import prefer_static as ps
 from gemlib.util import compute_state
 from gemlib.distributions import UniformInteger
 
+from hypergeometric import Hypergeometric
+
 tfd = tfp.distributions
 
 __all__ = ["chain_binomial_rippler"]
-
-
-def _get_src_states(stoichiometry):
-    """Iterate over rows in `stoichiometry` and return
-       the index of the column containing a `-1`"""
-    src_states = tf.where(tf.math.equal(stoichiometry, -1.0))
-    return src_states[:, 1]
 
 
 def _compute_state(initial_state, events, stoichiometry, closed=False):
@@ -141,15 +136,16 @@ def _pstep(z, x, p, ps, seed=None, validate_args=False):
     :param p: current probability
     :param ps: new probability
     """
-    offset = tf.where(ps <= p, 0.0, z)
-    prob = tf.where(ps <= p, ps / p, 1 - (1 - ps) / (1 - p))
-    total_count = tf.where(
-        ps <= p, tf.cast(z, p.dtype), tf.cast(x - z, p.dtype)
-    )
-    z_prime = offset + tfd.Binomial(
-        total_count=total_count, probs=prob, validate_args=validate_args,
-    ).sample(seed=seed)
-    return z_prime
+    with tf.name_scope("_pstep"):
+        offset = tf.where(ps <= p, 0.0, z)
+        prob = tf.where(ps <= p, ps / p, 1 - (1 - ps) / (1 - p))
+        total_count = tf.where(
+            ps <= p, tf.cast(z, p.dtype), tf.cast(x - z, p.dtype)
+        )
+        z_prime = offset + tfd.Binomial(
+            total_count=total_count, probs=prob, validate_args=validate_args, name="_pstep_Binomial",
+        ).sample(seed=seed)
+        return z_prime
 
 
 def _xstep(z_prime, x, xs, ps, seed=None, validate_args=False):
@@ -157,42 +153,21 @@ def _xstep(z_prime, x, xs, ps, seed=None, validate_args=False):
 
     Both xs >= x and xs < x are sampled and results selected.
     """
-    seeds = samplers.split_seed(seed, salt="_xstep")
+    with tf.name_scope("_xstep"):
+        seeds = samplers.split_seed(seed, salt="_xstep")
 
-    # xs >= x
-    # Switch off `validate_args` because `xs-x` may be -ve.
-    z_new_geq = z_prime + tfd.Binomial(
-        xs - x, probs=ps, validate_args=False
-    ).sample(seed=seeds[0])
+        # xs >= x
+        # Switch off `validate_args` because `xs-x` may be -ve.
+        z_new_geq = z_prime + tfd.Binomial(
+            xs - x, probs=ps, validate_args=False, name="_xstep_Binomial",
+        ).sample(seed=seeds[0])
 
-    # xs < x - explicitly vectorize
-    def one_hypergeom(args):
-        x, z_prime, xs, seed = args
-        return random_hypergeom(
-            n_samples=1,
-            N=x,
-            K=z_prime,
-            n=tf.math.minimum(x, xs),  # Guard against xs > x
-            seed=seed,
-            validate_args=validate_args,
-        )
+        # xs < x - explicitly vectorize
+        z_new_lt = Hypergeometric(
+            N=x, K=z_prime, n=tf.math.minimum(x, xs), validate_args=False, name="_xstep_Hypergeom",
+        ).sample(seed=seeds[1])
 
-    elems = [tf.reshape(foo, [-1]) for foo in (x, z_prime, xs)] + [
-        samplers.split_seed(
-            seed[1],
-            n=tf.reduce_prod(z_prime.shape),
-            salt="_xstep_vectorized_map",
-        )
-    ]
-    z_new_lt = tf.reshape(
-        tf.cast(
-            tf.map_fn(one_hypergeom, elems, fn_output_signature=z_prime.dtype),
-            z_prime.dtype,
-        ),
-        z_prime.shape,
-    )
-
-    return tf.where(xs >= x, z_new_geq, z_new_lt)
+        return tf.where(xs >= x, z_new_geq, z_new_lt)
 
 
 def _dispatch_update(z, x, p, xs, ps, seed=None, validate_args=False):
@@ -218,7 +193,6 @@ def _dispatch_update(z, x, p, xs, ps, seed=None, validate_args=False):
 
         seeds = samplers.split_seed(seed, salt="_dispatch_update")
 
-        # Update for p->ps first
         z_prime = _pstep(z, x, p, ps, seed=seeds[0])
         z_new = _xstep(
             z_prime, x, xs, ps, seed=seeds[1], validate_args=validate_args
@@ -304,10 +278,10 @@ def chain_binomial_rippler(model, current_events, seed=None):
     init_seed, ripple_seed = samplers.split_seed(
         seed, salt="chain_binomial_rippler"
     )
-    src_states = _get_src_states(
-        model.stoichiometry
-    )  # source state of each transition
-
+    # src_states = _get_src_states(
+    #     model.stoichiometry
+    # )  # source state of each transition
+    src_states = model.source_states
     # Transpose to [T, S/R, M]
     current_events = tf.transpose(current_events, perm=(1, 2, 0))
 
@@ -341,12 +315,15 @@ def chain_binomial_rippler(model, current_events, seed=None):
 
             current_p = transition_probs(current_state_t)
             new_p = transition_probs(new_state_t)
+            
+            x = ps.gather(current_state_t, indices=src_states)
+            xs = ps.gather(new_state_t, indices=src_states)
 
             update = _dispatch_update(
                 current_events_t,
-                tf.gather(current_state_t, indices=src_states),
+                x,
                 current_p,
-                tf.gather(new_state_t, indices=src_states),
+                xs,
                 new_p,
                 seed,
             )
