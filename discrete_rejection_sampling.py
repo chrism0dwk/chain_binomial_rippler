@@ -128,7 +128,6 @@ def log_concave_rejection_sampler(
     probs = prob_fn(in_bounds_values)
     return tf.where(out_of_bounds_mask, tf.zeros([], probs.dtype), probs)
 
-  foo = brs.batched_rejection_sampler(
-          proposal, target, seed, dtype=dtype)  # Discard `num_iters`.
-
-  return tf.stop_gradient(foo[0]), tf.stop_gradient(foo[1])
+  return tf.stop_gradient(
+      brs.batched_rejection_sampler(
+          proposal, target, seed, dtype=dtype)[0])  # Discard `num_iters`.

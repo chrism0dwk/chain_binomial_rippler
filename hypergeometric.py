@@ -93,7 +93,7 @@ class Hypergeometric(tfd.Distribution):
     
     def _sample_n(self, n, seed=None):
         with tf.name_scope(self.name + "/sample_n"):
-            sample, num_iter =  log_concave_rejection_sampler(
+            sample =  log_concave_rejection_sampler(
                 self._mode(),
                 self.prob,
                 dtype=tf.float32,
