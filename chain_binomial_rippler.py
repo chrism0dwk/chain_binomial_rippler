@@ -163,10 +163,19 @@ def _xstep(z_prime, x, xs, ps, seed=None, validate_args=False):
         ).sample(seed=seeds[0])
 
         # xs < x - explicitly vectorize
-        z_new_lt = Hypergeometric(
-            N=x, K=z_prime, n=tf.math.minimum(x, xs), validate_args=False, name="_xstep_Hypergeom",
-        ).sample(seed=seeds[1])
-
+        def safe_hypergeom(N, K, n):
+            # xs is clipped to min(x, xs) to avoid errors in the Hypergeometric 
+            # sampler these values won't be selected anyway due to the 
+            # xs >= x condition below.
+            return Hypergeometric(
+                N=N, 
+                K=K, 
+                n=tf.math.minimum(N, n), 
+                validate_args=False,
+                name="_xstep_Hypergeom",
+            )
+        z_new_lt = safe_hypergeom(x, z_prime, xs).sample(seed=seeds[1])
+        
         return tf.where(xs >= x, z_new_geq, z_new_lt)
 
 
