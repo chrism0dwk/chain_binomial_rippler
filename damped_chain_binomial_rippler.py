@@ -55,75 +55,70 @@ def _compute_state(initial_state, events, stoichiometry, closed=False):
 class DampingFunction:
     def __init__(self, p, upper_bound, gamma):
         self._parameters = locals()
+        self._dtype = self.p.dtype
 
     @property
     def p(self):
-        return self._parameters["p"]
+        return tf.convert_to_tensor(self._parameters["p"])
 
     @property
     def upper_bound(self):
-        return self._parameters["upper_bound"]
+        return tf.convert_to_tensor(self._parameters["upper_bound"])
 
     @property
     def gamma(self):
-        return self._parameters["gamma"]
+        return tf.convert_to_tensor(self._parameters["gamma"])
 
-    def __call__(self, r):
-        r_transformed = (
-            self.p
-            + (self.upper_bound - self.p) ** (1 - self.gamma)
-            * (r - self.p) ** self.gamma
-        )
+    def __call__(self, u):
+        u = tf.convert_to_tensor(u, dtype=self._dtype)
+
+        r_transformed = self.p + tf.math.pow(
+            self.upper_bound - self.p, 1 - self.gamma
+        ) * tf.math.pow(u - self.p, self.gamma)
         return tf.where(
-            (self.p < r) & (r <= self.upper_bound), r_transformed, r
+            (self.p < u) & (u <= self.upper_bound), r_transformed, u
+        )
+
+    def forward(self, u):
+        return self.__call__(u)
+
+    def inverse(self, u):
+        u = tf.convert_to_tensor(u, dtype=self._dtype)
+
+        r_transformed = self.p + tf.math.pow(
+            u - self.p, 1 / self.gamma
+        ) * tf.math.pow(self.upper_bound - self.p, 1 - 1 / self.gamma)
+        return tf.where(
+            (self.p < u) & (u <= self.upper_bound), r_transformed, u
+        )
+
+    def log_forward_jacobian(self, u):
+        u = tf.convert_to_tensor(u, dtype=self._dtype)
+
+        return self.gamma * tf.math.pow(
+            (u - self.p) / (self.upper_bound - self.p), self.gamma - 1
         )
 
     def log_inverse_jacobian(self, u):
         """N.B. only implemented for p < u <= upper_bound"""
-        return (
+        u = tf.convert_to_tensor(u, dtype=self._dtype)
+
+        deriv = (
             (1.0 - 1.0 / self.gamma) * tf.math.log(self.upper_bound - self.p)
             + (1 / self.gamma - 1) * tf.math.log(u - self.p)
             - tf.math.log(self.gamma)
         )
 
+        return tf.where((self.p < u) & (u < self.upper_bound), deriv, 0.0)
 
-def _mask_and_reduce(values, mask_index):
-    """Sets elements of `values` to 0 where the index
-    of the first dimension is at least `mask_index`. Then reduce 
-    over this masked dimension and return.
+
+def _reduce_first_n(values, n):
+    """Reduces the first `n` elements of `values` over the first dimension
+       of `values` in a vectorized way.
     """
-    seq = tf.range(tf.shape(values)[0], dtype=mask_index.dtype)
-    mask = tf.cast(seq[:, tf.newaxis, tf.newaxis] < mask_index, values.dtype)
+    seq = tf.range(tf.shape(values)[0], dtype=n.dtype)
+    mask = tf.cast(seq[:, tf.newaxis, tf.newaxis] < n, values.dtype)
     return tf.reduce_sum(values * mask, axis=0)
-
-
-def _p_step_log_acceptance_correction(v, w, p, ps, gamma, damping_fn, seed):
-
-    seeds = samplers.split_seed(seed, salt="_p_step_log_acceptance_correction")
-
-    upper_bound = 2 * ps - p
-
-    # Chunk up the sampling domain and use masking here
-    w_size = tf.math.reduce_max(w)
-    w_compl_size = tf.math.reduce_max(v - w)
-
-    u1 = tfd.Uniform(
-        low=p, high=p + 2 ** ((gamma - 1) / gamma) * (ps - p)
-    ).sample(sample_shape=w_size, seed=seeds[0])
-    u2 = tfd.Uniform(
-        low=p + 2 ** ((gamma - 1) / gamma) * (ps - p), high=upper_bound
-    ).sample(sample_shape=w_compl_size, seed=seeds[1])
-
-    log_jacobian_fwd = _mask_and_reduce(
-        damping_fn.log_inverse_jacobian(u1), w
-    ) + _mask_and_reduce(damping_fn.log_inverse_jacobian(u2), v - w)
-    log_jacobian_rev = _mask_and_reduce(
-        damping_fn.log_inverse_jacobian(damping_fn(u1)), w
-    ) + _mask_and_reduce(
-        damping_fn.log_inverse_jacobian(damping_fn(u2)), v - w
-    )
-
-    return log_jacobian_rev - log_jacobian_fwd
 
 
 def _p_step_ps_gt_p(z, x, p, ps, gamma, seed):
@@ -137,7 +132,7 @@ def _p_step_ps_gt_p(z, x, p, ps, gamma, seed):
     :param seed: a random seed.
     :returns: a tuple of ([R, M] tensor of new event numbers, log_acceptance_correction)
     """
-    seeds = samplers.split_seed(seed, n=3, salt="_p_step_ps_gt_p")
+    seeds = samplers.split_seed(seed, n=4, salt="_p_step_ps_gt_p")
 
     upper_bound = 2 * ps - p
 
@@ -149,11 +144,23 @@ def _p_step_ps_gt_p(z, x, p, ps, gamma, seed):
     v = tfd.Binomial(total_count=x - z, probs=p_v).sample(seed=seeds[0])
     w = tfd.Binomial(total_count=v, probs=p_w).sample(seed=seeds[1])
 
-    log_acceptance_correction = _p_step_log_acceptance_correction(
-        v, w, p, ps, gamma, damping_fn, seeds[2]
+    # Chunk up the sampling domain and use masking here
+    w_size = tf.math.reduce_max(w)
+    w_compl_size = tf.math.reduce_max(v - w)
+
+    u1 = tfd.Uniform(low=p, high=ps).sample(sample_shape=w_size, seed=seeds[2])
+    u2 = tfd.Uniform(low=ps, high=upper_bound).sample(
+        sample_shape=w_compl_size, seed=seeds[3]
     )
 
-    return z + w, log_acceptance_correction
+    log_jacobian_fwd = _reduce_first_n(
+        damping_fn.log_inverse_jacobian(u1), w
+    ) + _reduce_first_n(damping_fn.log_inverse_jacobian(u2), v - w)
+
+    return (
+        z + w,
+        log_jacobian_fwd,
+    )  # log_acceptance_correction
 
 
 def _p_step_ps_leq_p(z, x, p, ps, gamma, seed):
@@ -168,7 +175,9 @@ def _p_step_ps_leq_p(z, x, p, ps, gamma, seed):
     :returns: a tuple of ([R, M] tensor of new event numbers, log_acceptance_correction)
     """
 
-    seeds = samplers.split_seed(seed, n=3, salt="_p_step_ps_leq_p")
+    seeds = samplers.split_seed(seed, n=4, salt="_p_step_ps_leq_p")
+
+    # Sample z_new
     z_new = tfd.Binomial(total_count=z, probs=ps / p).sample(seed=seeds[0])
 
     # Jacobian
@@ -176,15 +185,35 @@ def _p_step_ps_leq_p(z, x, p, ps, gamma, seed):
     damping_fn = DampingFunction(ps, upper_bound, gamma)
 
     w = z - z_new
-    r = tfd.Binomial(x - z, (upper_bound - p) / (1 - p)).sample(seed=seeds[1])
+    w_prime = tfd.Binomial(
+        total_count=x - z, probs=(upper_bound - p) / (1 - p),
+    ).sample(seed=seeds[1])
 
-    log_acceptance_correction = _p_step_log_acceptance_correction(
-        w + r, w, ps, p, gamma, damping_fn, seeds[2],
+    # Chunk up the sampling domain and use masking here
+    w_size = tf.math.reduce_max(w)
+    w_compl_size = tf.math.reduce_max(w_prime)
+
+    p_non_centred = damping_fn.inverse(p)
+    u1 = tfd.Uniform(low=ps, high=p_non_centred).sample(
+        sample_shape=w_size, seed=seeds[2]
     )
-    return z_new, -log_acceptance_correction
+    u2 = tfd.Uniform(low=p_non_centred, high=upper_bound).sample(
+        sample_shape=w_compl_size, seed=seeds[3]
+    )
+
+    log_jacobian_fwd = _reduce_first_n(
+        damping_fn.log_inverse_jacobian(damping_fn(u1)), w
+    ) + _reduce_first_n(
+        damping_fn.log_inverse_jacobian(damping_fn(u2)), w_prime
+    )
+
+    return (
+        z_new,
+        -log_jacobian_fwd,
+    )  # log_acceptance_correction
 
 
-def _pstep(z, x, p, ps, gamma, seed=None):
+def _pstep(z, x, p, ps, gamma, seed):
     """Compute the p-step of Rippler.
 
     Since there are two possible distributions to draw from,
@@ -204,10 +233,11 @@ def _pstep(z, x, p, ps, gamma, seed=None):
 
         z_prime = tf.where(ps <= p, ps_leq_p[0], ps_gt_p[0])
         log_acceptance_correction = tf.where(ps <= p, ps_leq_p[1], ps_gt_p[1])
-        return z_prime, tf.reduce_sum(log_acceptance_correction)
+
+        return z_prime, log_acceptance_correction
 
 
-def _xstep(z_prime, x, xs, ps, seed=None, validate_args=False):
+def _xstep(z_prime, x, xs, ps, seed, validate_args=False):
     """Computes the x-step of the Rippler algorithm.
 
     Both xs >= x and xs < x are sampled and results selected.
@@ -239,7 +269,7 @@ def _xstep(z_prime, x, xs, ps, seed=None, validate_args=False):
         return tf.where(xs >= x, z_new_geq, z_new_lt)
 
 
-def _dispatch_update(z, x, p, xs, ps, gamma, seed=None, validate_args=False):
+def _dispatch_update(z, x, p, xs, ps, gamma, seed, validate_args=False):
     """Dispatches update function based on values of
        parameters.
 
@@ -267,7 +297,7 @@ def _dispatch_update(z, x, p, xs, ps, gamma, seed=None, validate_args=False):
             z_prime, x, xs, ps, seed=seeds[1], validate_args=validate_args
         )
 
-        return z_new, log_acceptance_correction
+        return z_new, tf.reduce_sum(log_acceptance_correction)
 
 
 # Tests
@@ -354,11 +384,7 @@ def default_initial_ripple(model, current_events, current_state, seed):
 
 
 def chain_binomial_rippler(
-    model,
-    current_events,
-    initial_ripple_fn,
-    ripple_damping_constant,
-    seed=None,
+    model, current_events, initial_ripple_fn, ripple_damping_constant, seed,
 ):
 
     init_seed, ripple_seed = samplers.split_seed(
@@ -407,7 +433,7 @@ def chain_binomial_rippler(
                 xs=prefer_static.gather(new_state_t, indices=src_states),
                 ps=new_p,
                 gamma=ripple_damping_constant,
-                seed=seed,
+                seed=ripple_seed,
             )
             tf.debugging.assert_non_negative(new_events)
 
