@@ -92,33 +92,59 @@ class DampingFunction:
             (self.p < u) & (u <= self.upper_bound), r_transformed, u
         )
 
-    def log_forward_jacobian(self, u):
-        u = tf.convert_to_tensor(u, dtype=self._dtype)
-
-        return self.gamma * tf.math.pow(
-            (u - self.p) / (self.upper_bound - self.p), self.gamma - 1
-        )
-
     def log_inverse_jacobian(self, u):
         """N.B. only implemented for p < u <= upper_bound"""
         u = tf.convert_to_tensor(u, dtype=self._dtype)
 
         deriv = (
             (1.0 - 1.0 / self.gamma) * tf.math.log(self.upper_bound - self.p)
-            + (1 / self.gamma - 1) * tf.math.log(u - self.p)
+            + (1.0 / self.gamma - 1.0) * tf.math.log(u - self.p)
             - tf.math.log(self.gamma)
         )
 
-        return tf.where((self.p < u) & (u < self.upper_bound), deriv, 0.0)
+        return tf.where((self.p < u) & (u <= self.upper_bound), deriv, 0.0)
 
 
 def _reduce_first_n(values, n):
     """Reduces the first `n` elements of `values` over the first dimension
        of `values` in a vectorized way.
     """
-    seq = tf.range(tf.shape(values)[0], dtype=n.dtype)
-    mask = tf.cast(seq[:, tf.newaxis, tf.newaxis] < n, values.dtype)
+    values_shape = tf.shape(values)
+    seq = tf.range(values_shape[0], dtype=n.dtype)
+    seq = tf.reshape(
+        seq, shape=[values_shape[0]] + [1] * len(values.shape[1:])
+    )
+    mask = tf.cast(seq < n, values.dtype)
     return tf.reduce_sum(values * mask, axis=0)
+
+
+def _reduce_uniforms(
+    p_low, p_high, size, u_transform_fn, seed, chunksize=10,
+):
+    """Generates `size` U(`p_low`, `p_high`) variates, and reduces
+    through the transform `u_transform_fn`."""
+
+    seed = samplers.sanitize_seed(seed, salt="binomial_log_jacobian")
+    size = tf.cast(size, tf.int32)
+
+    def cond(i, _):
+        return tf.reduce_sum(size - i * chunksize) > 0
+
+    def body(i, accum):
+        u = tfd.Uniform(low=p_low, high=p_high).sample(
+            sample_shape=chunksize, seed=seed
+        )
+        size_local = tf.clip_by_value(
+            size - i * chunksize, clip_value_min=0, clip_value_max=chunksize
+        )
+        log_jacobian = _reduce_first_n(u_transform_fn(u), size_local)
+        return i + 1, accum + log_jacobian
+
+    _, log_jacobian = tf.while_loop(
+        cond, body, loop_vars=(0, tf.zeros_like(p_low))
+    )
+
+    return log_jacobian
 
 
 def _p_step_ps_gt_p(z, x, p, ps, gamma, seed):
@@ -136,30 +162,25 @@ def _p_step_ps_gt_p(z, x, p, ps, gamma, seed):
 
     upper_bound = 2 * ps - p
 
-    damping_fn = DampingFunction(p, upper_bound, gamma)
+    damp = DampingFunction(p, upper_bound, gamma)
 
     p_v = (upper_bound - p) / (1.0 - p)
-    p_w = (damping_fn(ps) - p) / (upper_bound - p)
+    p_w = (damp(ps) - p) / (upper_bound - p)
 
     v = tfd.Binomial(total_count=x - z, probs=p_v).sample(seed=seeds[0])
     w = tfd.Binomial(total_count=v, probs=p_w).sample(seed=seeds[1])
 
     # Chunk up the sampling domain and use masking here
-    w_size = tf.math.reduce_max(w)
-    w_compl_size = tf.math.reduce_max(v - w)
+    def jacobian(x):
+        return damp.log_inverse_jacobian(x)
 
-    u1 = tfd.Uniform(low=p, high=ps).sample(sample_shape=w_size, seed=seeds[2])
-    u2 = tfd.Uniform(low=ps, high=upper_bound).sample(
-        sample_shape=w_compl_size, seed=seeds[3]
-    )
-
-    log_jacobian_fwd = _reduce_first_n(
-        damping_fn.log_inverse_jacobian(u1), w
-    ) + _reduce_first_n(damping_fn.log_inverse_jacobian(u2), v - w)
+    neg_log_inverse_jacobian = _reduce_uniforms(
+        p, ps, w, jacobian, seeds[2]
+    ) + _reduce_uniforms(ps, upper_bound, v - w, jacobian, seeds[3])
 
     return (
         z + w,
-        log_jacobian_fwd,
+        neg_log_inverse_jacobian,
     )  # log_acceptance_correction
 
 
@@ -189,23 +210,12 @@ def _p_step_ps_leq_p(z, x, p, ps, gamma, seed):
         total_count=x - z, probs=(upper_bound - p) / (1 - p),
     ).sample(seed=seeds[1])
 
-    # Chunk up the sampling domain and use masking here
-    w_size = tf.math.reduce_max(w)
-    w_compl_size = tf.math.reduce_max(w_prime)
+    def jacobian(x):
+        return damping_fn.log_inverse_jacobian(damping_fn(x))
 
-    p_non_centred = damping_fn.inverse(p)
-    u1 = tfd.Uniform(low=ps, high=p_non_centred).sample(
-        sample_shape=w_size, seed=seeds[2]
-    )
-    u2 = tfd.Uniform(low=p_non_centred, high=upper_bound).sample(
-        sample_shape=w_compl_size, seed=seeds[3]
-    )
-
-    log_jacobian_fwd = _reduce_first_n(
-        damping_fn.log_inverse_jacobian(damping_fn(u1)), w
-    ) + _reduce_first_n(
-        damping_fn.log_inverse_jacobian(damping_fn(u2)), w_prime
-    )
+    log_jacobian_fwd = _reduce_uniforms(
+        ps, p, w, jacobian, seeds[2],
+    ) + _reduce_uniforms(p, upper_bound, w_prime, jacobian, seed=seeds[3])
 
     return (
         z_new,
@@ -297,7 +307,7 @@ def _dispatch_update(z, x, p, xs, ps, gamma, seed, validate_args=False):
             z_prime, x, xs, ps, seed=seeds[1], validate_args=validate_args
         )
 
-        return z_new, tf.reduce_sum(log_acceptance_correction)
+        return z_new, log_acceptance_correction, ps > p
 
 
 # Tests
@@ -426,18 +436,18 @@ def chain_binomial_rippler(
             current_p = transition_probs(time, current_state_t)
             new_p = transition_probs(time, new_state_t)
 
-            new_events, log_acceptance_correction = _dispatch_update(
+            new_events, log_acceptance_correction, ps_gt_p = _dispatch_update(
                 z=current_events_t,
                 x=prefer_static.gather(current_state_t, indices=src_states),
                 p=current_p,
                 xs=prefer_static.gather(new_state_t, indices=src_states),
                 ps=new_p,
                 gamma=ripple_damping_constant,
-                seed=ripple_seed,
+                seed=seed,
             )
             tf.debugging.assert_non_negative(new_events)
 
-            return new_events, log_acceptance_correction
+            return new_events, log_acceptance_correction, ps_gt_p
 
     def time_loop_body(
         t,
@@ -445,6 +455,7 @@ def chain_binomial_rippler(
         new_state_t,
         new_events_buffer,
         log_acceptance_correction_accum,
+        ps_gt_p_accum,
         seed,
     ):
 
@@ -459,7 +470,7 @@ def chain_binomial_rippler(
         # tf.debugging.assert_non_negative(new_state_t1, summarize=100)
 
         # Gather current states and events, and draw new events
-        new_events_t1, log_acceptance_correction = draw_events(
+        new_events_t1, log_acceptance_correction, ps_gt_p = draw_events(
             t + 1,
             new_state_t1,
             current_events[t + 1],
@@ -477,16 +488,31 @@ def chain_binomial_rippler(
             new_events_t1,
             new_state_t1,
             new_events_buffer,
-            log_acceptance_correction_accum + log_acceptance_correction,
+            log_acceptance_correction_accum.write(
+                t, log_acceptance_correction
+            ),
+            ps_gt_p_accum.write(t, ps_gt_p),
             next_seed,
         )
 
-    def time_loop_cond(t, _1, _2, new_events_buffer, _3, _4):
+    def time_loop_cond(t, _1, _2, new_events_buffer, *_3):
         t_stop = t < (model.num_steps - 1)
         delta_stop = tf.reduce_any(new_events_buffer != current_events)
         return t_stop & delta_stop
 
-    _, _, _, new_events, log_acceptance_correction, _ = tf.while_loop(
+    log_acceptance_correction_accum = tf.TensorArray(
+        current_state.dtype, size=model.num_steps
+    )
+    ps_gt_p_accum = tf.TensorArray(tf.bool, size=model.num_steps)
+    (
+        _,
+        _,
+        _,
+        new_events,
+        log_acceptance_correction,
+        ps_gt_p_accum,
+        _,
+    ) = tf.while_loop(
         time_loop_cond,
         time_loop_body,
         loop_vars=(
@@ -494,7 +520,8 @@ def chain_binomial_rippler(
             new_events_t,
             current_state_t,
             new_events,
-            0.0,
+            log_acceptance_correction_accum,
+            ps_gt_p_accum,
             ripple_seed,
         ),
     )  # new_events.shape = [T, R, M]
@@ -504,7 +531,8 @@ def chain_binomial_rippler(
     return (
         new_events,
         {
-            "log_acceptance_correction": log_acceptance_correction,
+            "log_acceptance_correction": log_acceptance_correction.stack(),
+            "is_ps_gt_p": ps_gt_p_accum.stack(),
             "delta": tf.transpose(
                 new_events_t - current_events[proposed_time_idx]
             ),
@@ -528,6 +556,7 @@ CBRResults = namedtuple(
         "proposed_state",
         "proposed_target_log_prob",
         "log_acceptance_correction",
+        "is_ps_gt_p",
         "seed",
     ],
 )
@@ -614,7 +643,7 @@ but only the first will be used"
             delta_logp = (
                 proposed_target_log_prob
                 - previous_results.target_log_prob
-                + proposal_results["log_acceptance_correction"]
+                + tf.reduce_sum(proposal_results["log_acceptance_correction"])
             )
 
             def accept():
@@ -632,6 +661,7 @@ but only the first will be used"
                         log_acceptance_correction=proposal_results[
                             "log_acceptance_correction"
                         ],
+                        is_ps_gt_p=proposal_results["is_ps_gt_p"],
                         seed=seed_results,
                     ),
                 )
@@ -651,6 +681,7 @@ but only the first will be used"
                         log_acceptance_correction=proposal_results[
                             "log_acceptance_correction"
                         ],
+                        is_ps_gt_p=proposal_results["is_ps_gt_p"],
                         seed=seed_results,
                     ),
                 )
@@ -685,6 +716,7 @@ but only the first will be used"
                 )
             state_part = current_state_parts[0]
 
+            num_times = state_part.shape[-2]
             num_pop = state_part.shape[-3]
             num_transitions = state_part.shape[-1]
             num_states = self.model.stoichiometry.shape[-1]
@@ -704,8 +736,12 @@ but only the first will be used"
                 timepoint=tf.constant(0, dtype=tf.int32),
                 proposed_state=state_part,
                 proposed_target_log_prob=target_log_prob,
-                log_acceptance_correction=tf.constant(
-                    0.0, current_state[0].dtype
+                log_acceptance_correction=tf.zeros(
+                    (num_times, num_transitions, num_pop),
+                    current_state[0].dtype,
+                ),
+                is_ps_gt_p=tf.fill(
+                    (num_times, num_transitions, num_pop), False
                 ),
                 seed=samplers.sanitize_seed(0),
             )
